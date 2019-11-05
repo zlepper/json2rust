@@ -21,16 +21,17 @@ pub enum JsonTokenType {
     ObjectEnd,
     ArrayStart,
     ArrayEnd,
-    String,
+    String(String),
     Float,
     Int,
     Bool,
     Colon,
 }
 
-#[derive(Debug, Eq, PartialEq, Copy, Clone)]
+#[derive(Debug, Eq, PartialEq, Clone)]
 struct TokenizerStringReadingState {
     starting_location: JsonTokenInfo,
+    value: String,
     escape_next: bool,
 }
 
@@ -83,6 +84,7 @@ pub fn tokenize_json(json: &str) -> Result<Vec<JsonToken>, Error> {
                         state = TokenizerState::ReadingString(TokenizerStringReadingState {
                             starting_location: location,
                             escape_next: false,
+                            value: "".into(),
                         })
                     }
                     c if c.is_numeric() => {
@@ -93,6 +95,7 @@ pub fn tokenize_json(json: &str) -> Result<Vec<JsonToken>, Error> {
                             location,
                         ));
                     }
+                    ' ' => {}
                     _ => {
                         return Err(Error::UnknownJsonCharacter(location, current_char));
                     }
@@ -102,7 +105,8 @@ pub fn tokenize_json(json: &str) -> Result<Vec<JsonToken>, Error> {
                 if s.escape_next {
                     state = TokenizerState::ReadingString(TokenizerStringReadingState {
                         escape_next: false,
-                        starting_location: s.starting_location,
+                        value: format!("{}{}", s.value, current_char),
+                        ..*s
                     });
                     continue;
                 }
@@ -110,17 +114,26 @@ pub fn tokenize_json(json: &str) -> Result<Vec<JsonToken>, Error> {
                 match current_char {
                     '"' => {
                         // End reading this token
-                        tokens.push(JsonToken::new(JsonTokenType::String, s.starting_location));
+                        tokens.push(JsonToken::new(
+                            JsonTokenType::String(s.value.clone()),
+                            s.starting_location,
+                        ));
                         state = TokenizerState::Ready;
                     }
                     '\\' => {
                         state = TokenizerState::ReadingString(TokenizerStringReadingState {
                             escape_next: true,
+                            value: s.value.clone(),
                             starting_location: s.starting_location,
                         });
                     }
                     // We don't care about any other specific characters
-                    _ => {}
+                    _ => {
+                        state = TokenizerState::ReadingString(TokenizerStringReadingState {
+                            value: format!("{}{}", s.value, current_char),
+                            ..*s
+                        });
+                    }
                 }
             }
             TokenizerState::ReadingNumber(s) => match current_char {
@@ -147,28 +160,58 @@ pub fn tokenize_json(json: &str) -> Result<Vec<JsonToken>, Error> {
                 }
                 // This is fine, we just continue parsing it
                 c if c.is_numeric() => {}
+                ',' | ']' | '}' => {
+                    state = end_current_token(&mut tokens, &mut state)?;
+                    match current_char {
+                        ']' => tokens.push(JsonToken::new(
+                            JsonTokenType::ArrayEnd,
+                            JsonTokenInfo::new(line_number, column_number, index),
+                        )),
+                        '}' => tokens.push(JsonToken::new(
+                            JsonTokenType::ObjectEnd,
+                            JsonTokenInfo::new(line_number, column_number, index),
+                        )),
+                        _ => {}
+                    }
+                }
                 v => return Err(Error::InvalidNumberCharacter(s.starting_location, v)),
             },
         }
         column_number += 1;
     }
 
+    end_current_token(&mut tokens, &mut state)?;
+
+    Ok(tokens)
+}
+
+fn end_current_token(
+    mut tokens: &mut Vec<JsonToken>,
+    state: &mut TokenizerState,
+) -> Result<TokenizerState, Error> {
+    println!("Ending state: {:?}", state);
     match state {
         TokenizerState::ReadingString(s) => {
             return Err(Error::UnclosedString(s.starting_location));
         }
         TokenizerState::ReadingNumber(s) => {
-            if s.seen_decimal_char {
-                tokens.push(JsonToken::new(JsonTokenType::Float, s.starting_location));
-            } else {
-                tokens.push(JsonToken::new(JsonTokenType::Int, s.starting_location));
-            }
+            println!("Reading number");
+            add_number_to_tokens(&mut tokens, *s);
         }
         // If the tokenizer is simple ready, then we don't really have to do anything
         TokenizerState::Ready => {}
     }
+    Ok(TokenizerState::Ready)
+}
 
-    Ok(tokens)
+fn add_number_to_tokens(tokens: &mut Vec<JsonToken>, s: TokenizerNumberReadingState) -> () {
+    if s.seen_decimal_char {
+        println!("Seen decimal char");
+        tokens.push(JsonToken::new(JsonTokenType::Float, s.starting_location));
+    } else {
+        println!("Not seen decimal");
+        tokens.push(JsonToken::new(JsonTokenType::Int, s.starting_location));
+    }
 }
 
 #[cfg(test)]
@@ -211,23 +254,23 @@ mod tests {
             result,
             vec![
                 JsonTokenType::ObjectStart,
-                JsonTokenType::String,
+                JsonTokenType::String("foo".into()),
                 JsonTokenType::Colon,
-                JsonTokenType::String,
-                JsonTokenType::ArrayEnd
+                JsonTokenType::String("bar".into()),
+                JsonTokenType::ObjectEnd
             ]
         )
     }
 
     #[test]
     fn tokenizes_simple_string_array() {
-        let result = simple_tokenize(r#"[]"#);
+        let result = simple_tokenize(r#"["foo"]"#);
 
         assert_eq!(
             result,
             vec![
                 JsonTokenType::ArrayStart,
-                JsonTokenType::String,
+                JsonTokenType::String("foo".into()),
                 JsonTokenType::ArrayEnd
             ]
         )
@@ -269,10 +312,13 @@ mod tests {
             result,
             vec![
                 JsonTokenType::ObjectStart,
-                JsonTokenType::String,
+                JsonTokenType::String("foo".into()),
                 JsonTokenType::Colon,
-                JsonTokenType::String,
-                JsonTokenType::ArrayEnd
+                JsonTokenType::String("bar".into()),
+                JsonTokenType::String("baz".into()),
+                JsonTokenType::Colon,
+                JsonTokenType::String("bing".into()),
+                JsonTokenType::ObjectEnd
             ]
         )
     }
@@ -323,8 +369,28 @@ mod tests {
         assert_eq!(
             result,
             Err(Error::NumbersCannotStartWithZero(JsonTokenInfo::new(
-                1, 1, 0
+                1, 1, 0,
             )))
+        )
+    }
+
+    #[test]
+    fn nested_objects() {
+        let result = simple_tokenize(r#"{"foo": {"bar": "baz"}}"#);
+
+        assert_eq!(
+            result,
+            vec![
+                JsonTokenType::ObjectStart,
+                JsonTokenType::String("foo".into()),
+                JsonTokenType::Colon,
+                JsonTokenType::ObjectStart,
+                JsonTokenType::String("bar".into()),
+                JsonTokenType::Colon,
+                JsonTokenType::String("baz".into()),
+                JsonTokenType::ObjectEnd,
+                JsonTokenType::ObjectEnd,
+            ]
         )
     }
 }
